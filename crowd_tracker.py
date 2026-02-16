@@ -133,6 +133,7 @@ class PersonDetector:
     
     def _detect_hog(self, frame):
         """HOG-based pedestrian detection"""
+        
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         boxes, weights = self.hog.detectMultiScale(
             gray, winStride=(4, 4), padding=(8, 8), scale=1.05

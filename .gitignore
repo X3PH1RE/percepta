@@ -1,0 +1,30 @@
+# Large generated files
+synthetic_training_data.json
+crowd_tracking_data.json
+
+# Model files (optional - remove this line if you want to track the model)
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
