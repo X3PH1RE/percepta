@@ -10,15 +10,6 @@ from risk_analyzer import RiskReport, RiskLevel, get_risk_color, get_risk_color_
 
 
 class PredictionVisualizer:
-    """
-    Extended visualizer that shows:
-    - Current tracked positions
-    - Predicted future positions
-    - Movement arrows
-    - Density heatmap
-    - Risk indicators
-    """
-    
     def __init__(self, 
                  width: int = 800,
                  height: int = 600,
@@ -118,15 +109,7 @@ class PredictionVisualizer:
                          predictions: Dict,
                          time_horizon: int = 60,
                          show_trajectory: bool = True):
-        """
-        Draw predicted positions.
-        
-        Args:
-            canvas: Canvas to draw on
-            predictions: {obj_id: [[x, y], ...]} predicted trajectories
-            time_horizon: How many frames into future to show
-            show_trajectory: Whether to show full predicted path
-        """
+
         for obj_id, trajectory in predictions.items():
             if len(trajectory) == 0:
                 continue
@@ -383,21 +366,7 @@ class PredictionVisualizer:
                             prediction_horizon: int = 60,
                             show_heatmap: bool = False,
                             show_arrows: bool = True) -> np.ndarray:
-        """
-        Create complete visualization frame.
-        
-        Args:
-            current_state: Current object states from data collector
-            predictions: Predicted trajectories
-            risk_report: Risk analysis report
-            trails: Historical trails for objects
-            prediction_horizon: How far into predictions to visualize
-            show_heatmap: Whether to show density heatmap
-            show_arrows: Whether to show movement arrows
-        
-        Returns:
-            Visualization frame
-        """
+
         self.animation_frame += 1
         
         # Create base canvas
@@ -443,12 +412,7 @@ class PredictionVisualizer:
                                    predictions: Dict,
                                    risk_report: RiskReport = None,
                                    total_frames: int = 60) -> List[np.ndarray]:
-        """
-        Create animation showing predictions over time.
-        
-        Returns:
-            List of frames for animation
-        """
+
         frames = []
         
         for horizon in range(0, total_frames, 2):  # Skip frames for smoother animation
@@ -464,14 +428,6 @@ class PredictionVisualizer:
 
 
 class CombinedDisplay:
-    """
-    Creates a combined display with multiple panels:
-    - Main video with tracking
-    - Dot matrix visualization
-    - Prediction view
-    - Risk dashboard
-    """
-    
     def __init__(self, 
                  main_width: int = 960,
                  main_height: int = 540,
