@@ -25,6 +25,9 @@ VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd 2.mp4")
 #VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd3.webm")
 MODEL_PATH = os.environ.get("CROWD_MODEL_PATH", "crowd_predictor_model.pth")
 
+# Auto emergency only after stampede_probability stays above this for N consecutive *pipeline* frames.
+STAMPEDE_AUTO_CALL_THRESHOLD = 0.75
+STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES = 6  # between 5–7; single-frame spikes do not arm
 
 app = Flask(__name__)
 
@@ -131,6 +134,7 @@ class SystemRunner:
         self._last_tracked = 0
         self._loop_durations: deque = deque(maxlen=30)  # for smoothed FPS
         self._last_pipeline_fps = 0.0
+        self._stampede_high_streak = 0  # consecutive frames with prob > threshold
 
     def start(self):
         if self._running:
@@ -200,6 +204,11 @@ class SystemRunner:
             with self._lock:
                 self._frame_count += 1
                 self._last_tracked = len(data.get("current_state") or {})
+                rr = data.get("risk_report")
+                if rr is not None and float(rr.stampede_probability) >= STAMPEDE_AUTO_CALL_THRESHOLD:
+                    self._stampede_high_streak += 1
+                else:
+                    self._stampede_high_streak = 0
                 self._latest_views = {
                     "raw": raw_frame,
                     "main": main_display,
@@ -207,7 +216,7 @@ class SystemRunner:
                     "prediction": pred_display,
                     "stampede": stampede_view,
                 }
-                self._latest_risk = data.get("risk_report")
+                self._latest_risk = rr
 
             # Small sleep so we don't starve the event loop / CPU completely
             time.sleep(0.01)
@@ -231,6 +240,7 @@ class SystemRunner:
             fc = self._frame_count
             fps = float(self._last_pipeline_fps)
             tracked = self._last_tracked
+            streak = self._stampede_high_streak
         uptime = time.time() - self._started_at
         src = os.path.basename(self.video_path) or self.video_path
         w = getattr(self.system, "frame_width", 0)
@@ -260,10 +270,15 @@ class SystemRunner:
             "model_profile": "LSTM + risk fusion" if model_ok else "Kinematic extrapolation",
             "model_loaded": model_ok,
             "prediction_cadence_frames": pred_every,
+            "stampede_sustained_frames": streak,
+            "stampede_sustained_required": STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES,
         }
 
 
-def _serialize_risk(report: Optional[RiskReport]) -> Dict[str, Any]:
+def _serialize_risk(
+    report: Optional[RiskReport],
+    stampede_high_streak: int = 0,
+) -> Dict[str, Any]:
     if report is None:
         return {
             "available": False,
@@ -275,11 +290,14 @@ def _serialize_risk(report: Optional[RiskReport]) -> Dict[str, Any]:
             "overall_risk": 0.0,
             "timestamp": None,
             "should_auto_call": False,
+            "stampede_sustained_frames": 0,
+            "stampede_sustained_required": STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES,
         }
 
-    # Define when the system considers a stampede likely enough to suggest calling.
-    # Requirement: prediction probability must be above 75%.
-    stampede_flag = bool(float(report.stampede_probability) >= 0.75)
+    # Auto-call only if prob > 75% for STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES pipeline frames in a row.
+    sustained = stampede_high_streak >= STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES
+    over_threshold = float(report.stampede_probability) >= STAMPEDE_AUTO_CALL_THRESHOLD
+    should_auto = bool(sustained and over_threshold)
 
     return {
         "available": True,
@@ -290,7 +308,9 @@ def _serialize_risk(report: Optional[RiskReport]) -> Dict[str, Any]:
         "stampede_probability": float(report.stampede_probability),
         "overall_risk": float(report.overall_risk),
         "timestamp": float(report.timestamp),
-        "should_auto_call": bool(stampede_flag),
+        "should_auto_call": should_auto,
+        "stampede_sustained_frames": stampede_high_streak,
+        "stampede_sustained_required": STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES,
     }
 
 
@@ -339,8 +359,10 @@ def status():
     if system_runner is None:
         return jsonify({"available": False}), 503
 
-    report = system_runner.get_latest_risk()
-    payload = _serialize_risk(report)
+    with system_runner._lock:
+        report = system_runner._latest_risk
+        streak = system_runner._stampede_high_streak
+    payload = _serialize_risk(report, stampede_high_streak=streak)
     payload["system"] = system_runner.get_system_snapshot()
     return jsonify(payload)
 
@@ -874,8 +896,14 @@ INDEX_HTML = """
         riskLevelTextEl.textContent = (data.risk_level || "safe").toUpperCase();
 
         stampedeValueEl.textContent = formatPct(data.stampede_probability);
-        if (data.stampede_probability >= 0.75) {
-          stampedeSubEl.textContent = "High risk of stampede – emergency call will be prepared.";
+        var req = data.stampede_sustained_required || 6;
+        var st = data.stampede_sustained_frames || 0;
+        if (data.stampede_probability >= 0.75 && st >= req) {
+          stampedeSubEl.textContent = "Sustained high risk (" + req + "+ frames) – auto emergency armed.";
+        } else if (data.stampede_probability >= 0.75 && st > 0) {
+          stampedeSubEl.textContent = "Above 75% for " + st + "/" + req + " consecutive frames (need " + req + " to auto-call).";
+        } else if (data.stampede_probability >= 0.75) {
+          stampedeSubEl.textContent = "Spike above 75% – streak resets if next frame drops.";
         } else if (data.stampede_probability >= 0.4) {
           stampedeSubEl.textContent = "Elevated stampede probability – closely monitor crowd.";
         } else {
