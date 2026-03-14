@@ -23,6 +23,7 @@ from risk_analyzer import RiskReport, RiskLevel
 #VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd.mp4")
 VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd 2.mp4")
 #VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd3.webm")
+
 MODEL_PATH = os.environ.get("CROWD_MODEL_PATH", "crowd_predictor_model.pth")
 
 # Auto emergency only after stampede_probability stays above this for N consecutive *pipeline* frames.

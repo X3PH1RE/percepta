@@ -11,9 +11,10 @@ A real-time crowd tracking and movement prediction system using computer vision 
 3. [Installation](#installation)
 4. [Training the Model](#training-the-model)
 5. [Running the System](#running-the-system)
-6. [Controls](#controls)
-7. [Module Documentation](#module-documentation)
-8. [Troubleshooting](#troubleshooting)
+6. [Web Dashboard (Percepta)](#web-dashboard-percepta)
+7. [Controls](#controls)
+8. [Module Documentation](#module-documentation)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -33,6 +34,8 @@ Percepta performs the following tasks:
 
 6. **Visualization**: Displays real-time tracking, predicted trajectories, density heatmaps, and risk indicators.
 
+7. **Web Dashboard**: Optional browser UI (`web_dashboard.py`) for live feeds, risk metrics, emergency workflow, and stampede-zone maps.
+
 ---
 
 ## Architecture
@@ -45,6 +48,7 @@ crowd_predictor.py        - LSTM/GRU neural network for trajectory prediction
 risk_analyzer.py          - Safety risk evaluation and stampede detection
 prediction_visualizer.py  - Extended visualization with predictions
 crowd_prediction_system.py - Main integration and entry point
+web_dashboard.py          - Flask web UI: multi-view video, status API, emergency flow
 ```
 
 ### How Prediction Works
@@ -262,6 +266,77 @@ Three windows will open:
 
 ---
 
+## Web Dashboard (Percepta)
+
+The **Percepta** web dashboard runs the same pipeline as the desktop app inside a background thread and exposes it in the browser—useful for operators, demos, and sharing a single screen without OpenCV windows.
+
+### Install extra dependency
+
+```bash
+pip install flask
+```
+
+### Configure video (and optional model)
+
+By default the dashboard reads the same paths as the main system. You can override without editing code:
+
+| Environment variable | Purpose |
+|----------------------|--------|
+| `CROWD_VIDEO_PATH`   | Path to input video (e.g. `crowd.mp4`) |
+| `CROWD_MODEL_PATH`   | Path to `crowd_predictor_model.pth` (optional) |
+
+Or edit the defaults at the top of `web_dashboard.py` (`VIDEO_PATH`, `MODEL_PATH`).
+
+### Run the dashboard
+
+```bash
+python web_dashboard.py
+```
+
+Open **http://localhost:5000/** (server binds to `0.0.0.0:5000`).
+
+### Live view modes
+
+| View | Query | Description |
+|------|--------|-------------|
+| **Raw Video** | `view=raw` | Unmodified frames from the file (no overlays). |
+| **Real Recording** | `view=main` | Video with tracking and risk overlay (same idea as desktop main window). |
+| **Dot Matrix** | `view=dot` | Dot-matrix style positions / trails. |
+| **Prediction & Risk** | `view=prediction` | Prediction canvas with risk gauges and warnings. |
+| **Stampede zones** | `view=stampede` | Raw scene + density **hotspots** (where crush/stampede risk is concentrated). After an emergency call is placed, the banner **“EMERGENCY SERVICES NOTIFIED…”** appears on this view. |
+
+Switch views from the pill buttons above the video in the UI.
+
+### Risk & operations panel
+
+- Overall risk, stampede probability, density/velocity.
+- **Operations · Percepta Core**: ingest file name, resolution, pipeline FPS, uptime, frame count, model profile (LSTM vs extrapolation), prediction cadence, sustained stampede streak.
+
+### Emergency workflow
+
+1. **Manual**: **Call Emergency Now** starts a **10-second countdown** with message that emergency services will be called; **Cancel call** aborts before the call is placed.
+2. **Automatic**: Arms only when **stampede probability stays above 75% for several consecutive pipeline frames** (not a single spike). Defaults in `web_dashboard.py`:
+   - `STAMPEDE_AUTO_CALL_THRESHOLD = 0.75`
+   - `STAMPEDE_AUTO_CALL_CONSECUTIVE_FRAMES = 6` (tune between ~5–7 if you want)
+3. When the timer completes (manual or auto), `POST /emergency_call` runs; the UI can switch to **Stampede zones** and records hotspot coordinates for dispatch context.
+
+### HTTP API (for integration / debugging)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Dashboard HTML |
+| `/video_feed?view=…` | GET | MJPEG stream (`raw`, `main`, `dot`, `prediction`, `stampede`) |
+| `/status` | GET | JSON: risk metrics, `should_auto_call`, `stampede_sustained_frames` / `stampede_sustained_required`, `system` snapshot |
+| `/emergency_call` | POST | Marks dispatch active; returns `stampede_zones`, `open_stampede_view` |
+| `/cancel_emergency` | POST | Clears active call state if user cancelled countdown |
+
+### Notes
+
+- Flask’s dev server is fine for local use; for production, run behind a proper WSGI server and restrict network access.
+- Video smoothness depends on how fast your machine runs detection + prediction; the dashboard does not artificially cap FPS below what the pipeline achieves.
+
+---
+
 ## Controls
 
 | Key | Action |
@@ -331,6 +406,14 @@ Advanced visualization:
 - `CombinedDisplay`: Multi-panel layout option
 - Density heatmaps, movement arrows, hotspot indicators
 
+### web_dashboard.py
+
+Browser dashboard:
+
+- Flask app + background `SystemRunner` (same `CrowdPredictionSystem` as desktop)
+- Multi-view MJPEG feeds and `/status` JSON
+- Emergency countdown, sustained-threshold auto-arm, stampede-zone overlay for dispatch
+
 ---
 
 ## Troubleshooting
@@ -377,6 +460,12 @@ Increase tracking distance in `crowd_prediction_system.py`:
 ```python
 max_distance = int(120 * self.scale_factor)  # Increase from 80
 ```
+
+### Web dashboard: broken video or 500 on `/status`
+
+- Ensure `CROWD_VIDEO_PATH` points to a valid file and restart `web_dashboard.py`.
+- Flask 3.x: the app no longer uses deprecated `before_first_request`; if you fork old snippets, start the runner at import time as in the current `web_dashboard.py`.
+- If JSON errors mention `bool_`, ensure risk payloads use native Python floats/bools (current code casts these for `/status`).
 
 ---
 
