@@ -10,6 +10,7 @@ Provides a browser-based view with:
 import os
 import time
 import threading
+from collections import deque
 from typing import Optional, Dict, Any
 
 import cv2
@@ -19,11 +20,90 @@ from crowd_prediction_system import CrowdPredictionSystem
 from risk_analyzer import RiskReport, RiskLevel
 
 
-VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd.mp4")
+#VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd.mp4")
+VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd 2.mp4")
+#VIDEO_PATH = os.environ.get("CROWD_VIDEO_PATH", r"crowd3.webm")
 MODEL_PATH = os.environ.get("CROWD_MODEL_PATH", "crowd_predictor_model.pth")
 
 
 app = Flask(__name__)
+
+
+def _draw_stampede_zones_view(
+    raw_bgr,
+    risk_report: Optional[RiskReport],
+    emergency_notify: bool,
+    frame_count: int,
+) -> Any:
+    """
+    Raw scene + marked zones where crush/stampede risk is concentrated
+    (density hotspots). While emergency services are being notified, adds
+    a dispatch banner and stronger markers.
+    """
+    out = raw_bgr.copy()
+    h, w = out.shape[:2]
+    scale = max(w, h) / 1000.0
+
+    if risk_report and risk_report.hotspots:
+        for i, (hx, hy, hrisk) in enumerate(risk_report.hotspots):
+            cx, cy = int(hx), int(hy)
+            cx = max(0, min(w - 1, cx))
+            cy = max(0, min(h - 1, cy))
+            r = int(35 + 80 * float(hrisk))
+            thickness = 4 if emergency_notify else 2
+            # Outer warning ring (BGR red)
+            cv2.circle(out, (cx, cy), r, (0, 0, 255), thickness)
+            cv2.circle(out, (cx, cy), max(8, r // 4), (0, 165, 255), -1)
+            label = f"ZONE {i + 1}  {float(hrisk) * 100:.0f}%"
+            cv2.putText(
+                out,
+                label,
+                (cx - min(120, cx), max(22, cy - r - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55 * scale,
+                (255, 255, 255),
+                max(1, int(2 * scale)),
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                out,
+                "STAMPEDE RISK",
+                (cx - min(100, cx), min(h - 8, cy + r + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45 * scale,
+                (200, 200, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+    # Predicted crowding at +2s from LSTM paths (optional secondary marks)
+    if risk_report and emergency_notify:
+        bar = out.copy()
+        cv2.rectangle(bar, (0, 0), (w, 52), (0, 0, 160), -1)
+        cv2.addWeighted(bar, 0.85, out, 0.15, 0, out)
+        cv2.putText(
+            out,
+            "EMERGENCY SERVICES NOTIFIED — STAMPEDE-PRONE ZONES BELOW",
+            (12, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65 * scale,
+            (255, 255, 255),
+            max(1, int(2 * scale)),
+            cv2.LINE_AA,
+        )
+    elif risk_report and risk_report.hotspots:
+        cv2.putText(
+            out,
+            "Stampede-zone map (density / convergence)",
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5 * scale,
+            (220, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return out
 
 
 class SystemRunner:
@@ -33,6 +113,8 @@ class SystemRunner:
     """
 
     def __init__(self, video_path: str, model_path: Optional[str]):
+        self.video_path = video_path
+        self.model_path = model_path
         self.system = CrowdPredictionSystem(
             video_path=video_path,
             model_path=model_path,
@@ -44,6 +126,11 @@ class SystemRunner:
         self._latest_risk: Optional[RiskReport] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._started_at = time.time()
+        self._frame_count = 0
+        self._last_tracked = 0
+        self._loop_durations: deque = deque(maxlen=30)  # for smoothed FPS
+        self._last_pipeline_fps = 0.0
 
     def start(self):
         if self._running:
@@ -62,6 +149,7 @@ class SystemRunner:
         # to the event loop. This removes artificial throttling so the
         # effective frame rate is limited primarily by model processing time.
         while self._running:
+            loop_t0 = time.perf_counter()
             ret, frame = cap.read()
             if not ret:
                 # Loop video
@@ -97,12 +185,27 @@ class SystemRunner:
                     show_heatmap=self.system.show_heatmap,
                 )
 
+            risk_rep = data.get("risk_report")
+            notify = bool(EMERGENCY_STATE.get("active_call"))
+            stampede_view = _draw_stampede_zones_view(
+                raw_frame, risk_rep, notify, self._frame_count + 1
+            )
+
+            dt = time.perf_counter() - loop_t0
+            self._loop_durations.append(dt)
+            if self._loop_durations:
+                avg_dt = sum(self._loop_durations) / len(self._loop_durations)
+                self._last_pipeline_fps = 1.0 / max(avg_dt, 1e-6)
+
             with self._lock:
+                self._frame_count += 1
+                self._last_tracked = len(data.get("current_state") or {})
                 self._latest_views = {
                     "raw": raw_frame,
                     "main": main_display,
                     "dot": dot_matrix,
                     "prediction": pred_display,
+                    "stampede": stampede_view,
                 }
                 self._latest_risk = data.get("risk_report")
 
@@ -121,6 +224,43 @@ class SystemRunner:
     def get_latest_risk(self) -> Optional[RiskReport]:
         with self._lock:
             return self._latest_risk
+
+    def get_system_snapshot(self) -> Dict[str, Any]:
+        """Operational metrics for a realistic status panel."""
+        with self._lock:
+            fc = self._frame_count
+            fps = float(self._last_pipeline_fps)
+            tracked = self._last_tracked
+        uptime = time.time() - self._started_at
+        src = os.path.basename(self.video_path) or self.video_path
+        w = getattr(self.system, "frame_width", 0)
+        h = getattr(self.system, "frame_height", 0)
+        model_ok = self.model_path is not None
+        pred_every = getattr(self.system, "prediction_interval", 15)
+        # Pipeline health: FPS and frames processed
+        if fps >= 1.0:
+            health = "Nominal"
+            health_detail = "Processing within SLA"
+        elif fps >= 0.3:
+            health = "Degraded"
+            health_detail = "Heavy load — latency elevated"
+        else:
+            health = "Limited"
+            health_detail = "Pipeline backlogged"
+        return {
+            "pipeline_health": health,
+            "pipeline_detail": health_detail,
+            "pipeline_fps": round(fps, 2),
+            "frames_processed": fc,
+            "uptime_sec": round(uptime, 1),
+            "ingest_source": src,
+            "ingest_resolution": f"{w}×{h}" if w and h else "—",
+            "source_fps_nominal": int(getattr(self.system, "fps", 30) or 30),
+            "trackers_active": tracked,
+            "model_profile": "LSTM + risk fusion" if model_ok else "Kinematic extrapolation",
+            "model_loaded": model_ok,
+            "prediction_cadence_frames": pred_every,
+        }
 
 
 def _serialize_risk(report: Optional[RiskReport]) -> Dict[str, Any]:
@@ -195,18 +335,21 @@ def video_feed():
 
 @app.route("/status")
 def status():
-    """Current risk and stampede status."""
+    """Current risk, stampede status, and system operations snapshot."""
     if system_runner is None:
         return jsonify({"available": False}), 503
 
     report = system_runner.get_latest_risk()
-    return jsonify(_serialize_risk(report))
+    payload = _serialize_risk(report)
+    payload["system"] = system_runner.get_system_snapshot()
+    return jsonify(payload)
 
 
 EMERGENCY_STATE = {
     "last_call_time": None,
     "last_cancel_time": None,
     "active_call": False,
+    "zones_at_dispatch": [],  # [[x,y,risk], ...] when call placed
 }
 
 
@@ -219,7 +362,20 @@ def emergency_call():
     """
     EMERGENCY_STATE["last_call_time"] = time.time()
     EMERGENCY_STATE["active_call"] = True
-    return jsonify({"status": "calling", "message": "Emergency services have been notified."})
+    zones = []
+    if system_runner:
+        rep = system_runner.get_latest_risk()
+        if rep and rep.hotspots:
+            zones = [
+                [float(x), float(y), float(r)] for x, y, r in rep.hotspots
+            ]
+    EMERGENCY_STATE["zones_at_dispatch"] = zones
+    return jsonify({
+        "status": "calling",
+        "message": "Emergency services have been notified.",
+        "stampede_zones": zones,
+        "open_stampede_view": True,
+    })
 
 
 @app.route("/cancel_emergency", methods=["POST"])
@@ -485,6 +641,7 @@ INDEX_HTML = """
         <button id="view-main" style="padding:4px 10px; border-radius:999px; border:1px solid #4b5563; background:#111827; color:#e5e7eb; cursor:pointer;">Real Recording</button>
         <button id="view-dot" style="padding:4px 10px; border-radius:999px; border:1px solid #1f2937; background:#020617; color:#9ca3af; cursor:pointer;">Dot Matrix</button>
         <button id="view-prediction" style="padding:4px 10px; border-radius:999px; border:1px solid #1f2937; background:#020617; color:#9ca3af; cursor:pointer;">Prediction & Risk</button>
+        <button id="view-stampede" style="padding:4px 10px; border-radius:999px; border:1px solid #7f1d1d; background:#1c1917; color:#fecaca; cursor:pointer;" title="Hotspots where stampede risk is highest">Stampede zones</button>
       </div>
       <div class="video-wrapper">
         <img id="video-feed" src="/video_feed?view=main" alt="Live crowd monitoring" />
@@ -520,10 +677,13 @@ INDEX_HTML = """
           </div>
           <div class="stat-sub">Crowd concentration & sudden movement</div>
         </div>
-        <div class="stat">
-          <div class="stat-label">System Status</div>
-          <div class="stat-value" id="system-status">Starting…</div>
-          <div class="stat-sub" id="system-timestamp">—</div>
+        <div class="stat" style="grid-column: 1 / -1;">
+          <div class="stat-label">Operations · Percepta Core</div>
+          <div class="stat-value" id="system-status" style="font-size:0.95rem;">Initializing pipeline…</div>
+          <div class="stat-sub" id="system-timestamp" style="margin-top:6px; line-height:1.45;">
+            <span id="sys-line1">—</span><br/>
+            <span id="sys-line2" style="color:#9ca3af;">—</span>
+          </div>
         </div>
       </div>
 
@@ -563,12 +723,14 @@ INDEX_HTML = """
     const btnMain = document.getElementById("view-main");
     const btnDot = document.getElementById("view-dot");
     const btnPrediction = document.getElementById("view-prediction");
+    const btnStampede = document.getElementById("view-stampede");
     function setActiveViewButton(active) {
       const buttons = [
         { el: btnRaw, id: "raw" },
         { el: btnMain, id: "main" },
         { el: btnDot, id: "dot" },
         { el: btnPrediction, id: "prediction" },
+        { el: btnStampede, id: "stampede" },
       ];
       buttons.forEach(({ el, id }) => {
         if (id === active) {
@@ -581,6 +743,15 @@ INDEX_HTML = """
           el.style.borderColor = "#1f2937";
         }
       });
+      if (btnStampede && active !== "stampede") {
+        btnStampede.style.background = "#1c1917";
+        btnStampede.style.color = "#fecaca";
+        btnStampede.style.borderColor = "#7f1d1d";
+      } else if (btnStampede && active === "stampede") {
+        btnStampede.style.background = "#450a0a";
+        btnStampede.style.color = "#fff";
+        btnStampede.style.borderColor = "#ef4444";
+      }
     }
 
     btnRaw.addEventListener("click", () => {
@@ -599,6 +770,10 @@ INDEX_HTML = """
       videoEl.src = "/video_feed?view=prediction";
       setActiveViewButton("prediction");
     });
+    btnStampede.addEventListener("click", () => {
+      videoEl.src = "/video_feed?view=stampede&_=" + Date.now();
+      setActiveViewButton("stampede");
+    });
 
     const statusUrl = "/status";
     const emergencyUrl = "/emergency_call";
@@ -614,6 +789,8 @@ INDEX_HTML = """
     const velocityRiskEl = document.getElementById("velocity-risk");
     const systemStatusEl = document.getElementById("system-status");
     const systemTimestampEl = document.getElementById("system-timestamp");
+    const sysLine1El = document.getElementById("sys-line1");
+    const sysLine2El = document.getElementById("sys-line2");
     const autoTriggerIndicatorEl = document.getElementById("auto-trigger-indicator");
 
     const manualBtn = document.getElementById("manual-emergency-btn");
@@ -649,22 +826,47 @@ INDEX_HTML = """
       return d.toLocaleTimeString();
     }
 
+    function formatUptime(sec) {
+      if (sec == null || sec < 0) return "0s";
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      if (h > 0) return h + "h " + m + "m " + s + "s";
+      if (m > 0) return m + "m " + s + "s";
+      return s + "s";
+    }
+
     async function pollStatus() {
       try {
         const resp = await fetch(statusUrl);
         if (!resp.ok) {
-          systemStatusEl.textContent = "Offline";
-          systemTimestampEl.textContent = "Dashboard could not reach prediction service";
+          systemStatusEl.textContent = "DISCONNECTED · Control plane unreachable";
+          sysLine1El.textContent = "No heartbeat from Percepta core.";
+          sysLine2El.textContent = "Check that web_dashboard.py is running and port 5000 is open.";
           return;
         }
         const data = await resp.json();
+        const sys = data.system || {};
 
         if (!data.available) {
-          systemStatusEl.textContent = "Waiting for frames…";
-          systemTimestampEl.textContent = "Ensure the video source is available.";
+          systemStatusEl.textContent = "STANDBY · Awaiting video ingest";
+          sysLine1El.textContent = "Ingest: " + (sys.ingest_source || "—") + " · No frames yet.";
+          sysLine2El.textContent = "Confirm file path or camera binding.";
         } else {
-          systemStatusEl.textContent = "Running";
-          systemTimestampEl.textContent = "Last update: " + formatTime(data.timestamp);
+          const health = sys.pipeline_health || "Nominal";
+          const fps = sys.pipeline_fps != null ? sys.pipeline_fps.toFixed(2) : "—";
+          systemStatusEl.textContent = health.toUpperCase() + " · " + fps + " FPS · " + (sys.trackers_active ?? 0) + " tracks";
+          sysLine1El.textContent =
+            "Ingest: " + (sys.ingest_source || "—") +
+            " · " + (sys.ingest_resolution || "—") +
+            " · nominal " + (sys.source_fps_nominal || 30) + " fps source";
+          sysLine2El.textContent =
+            "Uptime " + formatUptime(sys.uptime_sec) +
+            " · " + (sys.frames_processed || 0) + " frames · " +
+            (sys.model_profile || "—") +
+            " · predict every " + (sys.prediction_cadence_frames || 15) + " fr · " +
+            (sys.pipeline_detail || "") +
+            " · scene sync " + formatTime(data.timestamp);
         }
 
         overallRiskEl.textContent = formatPct(data.overall_risk);
@@ -694,8 +896,9 @@ INDEX_HTML = """
           pendingAutoTrigger = false;
         }
       } catch (e) {
-        systemStatusEl.textContent = "Offline";
-        systemTimestampEl.textContent = "Error contacting backend dashboard service.";
+        systemStatusEl.textContent = "NETWORK FAULT · Dashboard API error";
+        sysLine1El.textContent = "Could not poll /status.";
+        sysLine2El.textContent = String(e && e.message ? e.message : "Retry in a few seconds.");
       }
     }
 
@@ -746,7 +949,12 @@ INDEX_HTML = """
       try {
         const resp = await fetch(emergencyUrl, { method: "POST" });
         const data = await resp.json().catch(() => ({}));
-        emergencyMessageEl.textContent = data.message || "Emergency services have been notified.";
+        emergencyMessageEl.textContent = (data.message || "Emergency services have been notified.") +
+          (data.open_stampede_view ? " Open «Stampede zones» to share hotspot map with dispatch." : "");
+        if (data.open_stampede_view) {
+          videoEl.src = "/video_feed?view=stampede&_=" + Date.now();
+          setActiveViewButton("stampede");
+        }
       } catch (e) {
         emergencyMessageEl.textContent = "Attempted to call emergency services, but the backend returned an error. Confirm via normal phone line.";
       }
